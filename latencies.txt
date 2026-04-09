@@ -1,0 +1,19 @@
+Date: 2026-04-09
+Model: TinyLlama-1.1B
+Test: 10 sequential requests
+
+Request 1: 3.39s
+Request 2: 0.68s
+Request 3: 3.47s
+Request 4: 0.30s
+Request 5: 2.88s
+Request 6: 3.51s
+Request 7: 3.49s
+Request 8: 3.48s
+Request 9: 3.52s
+Request 10: 3.77s
+Request 11: 3.51s
+
+Average latency: 2.91s
+Min: 0.30s
+Max: 3.77s
