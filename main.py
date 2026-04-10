@@ -10,6 +10,34 @@ from xml.parsers.expat import model
 import torch
 from transformers import pipeline, TextIteratorStreamer
 from threading import Thread
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+
+from fastapi.responses import StreamingResponse
+
+
+class ChatRequest(BaseModel):
+    question: str
+
+app = FastAPI()
+
+origins = [
+    "http://localhost.tiangolo.com",
+    "https://localhost.tiangolo.com",
+    "http://localhost:5173",
+    "http://localhost:8080",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 
 
@@ -48,8 +76,45 @@ generation_kwargs = dict(text_inputs=messages, streamer=streamer, max_new_tokens
 thread = Thread(target=pipe, kwargs=generation_kwargs)
 thread.start()
 for new_token in streamer:
-    print(new_token, end="", flush=True)
+        # print(new_token, end="", flush=True)
+        pass
 thread.join()
+
+async def chat(question: str):
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a friendly chatbot who always responds in the style of a pirate",
+        },
+        {"role": "user", "content":     question},
+    ]
+    streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
+    prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = pipe.tokenizer(prompt, return_tensors="pt").to(pipe.device)
+    generation_kwargs = dict(text_inputs=messages, streamer=streamer, max_new_tokens=200)
+    thread = Thread(target=pipe, kwargs=generation_kwargs)
+    thread.start()
+    for new_token in streamer:
+        yield new_token
+    thread.join()
+
+
+async def chat_sse(question: str):
+    async for new_token in chat(question):
+        yield f"data: {new_token}\n\n"
+    yield "data: [DONE]\n\n"
+    
+    
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+@app.post("/chat")
+async def main(payload: ChatRequest):
+
+    
+    return StreamingResponse(chat_sse(payload.question), media_type="text/event-stream") 
+    
 
 
 # latencies = []
