@@ -57,16 +57,16 @@ class InferenceEngine:
                 inputs = self.pipe.tokenizer(prompt, return_tensors="pt").to(self.pipe.device)
                 generation_kwargs = dict(text_inputs=prompt, streamer=streamer, max_new_tokens=200)
                 
-                    
+
                 # New thread for generation
                 thread = Thread(target=self.pipe, kwargs=generation_kwargs)
                 thread.start()
                 
                 
                 # Push tokens to result queue 
-                for i in streamer:
-                    print(f"Token :{i}")
-                    await request.result_queue.put(i)
+                for token in streamer:
+                    print(f"Token :{token}")
+                    await request.result_queue.put(token)
                 thread.join()
                 
                 
