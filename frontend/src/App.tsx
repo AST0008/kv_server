@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import "./App.css";
+import { flushSync } from "react-dom";
 
 function App() {
   const [question, setQuestion] = useState("");
@@ -17,7 +18,7 @@ function App() {
     try {
       setError(null);
       setResponse("");
-      setIsStreaming(true);
+      flushSync(() => setIsStreaming(true));
 
       const res = await fetch("http://localhost:8000/chat", {
         method: "POST",
@@ -34,15 +35,16 @@ function App() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let streamDone = false;
 
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by double newlines
         const events = buffer.split("\n\n");
-        buffer = events.pop() ?? "";
+        buffer = events.pop() || "";
 
         for (const event of events) {
           const dataLines = event
@@ -52,23 +54,29 @@ function App() {
 
           if (dataLines.length === 0) continue;
 
-          const data = dataLines.join("\n");
+          let data = dataLines.join("\n");
+
+          if (!data) continue;
+          console.log("Received chunk:", JSON.stringify(data));
           if (data === "[DONE]") {
-            streamDone = true;
-            break;
+            flushSync(() => setIsStreaming(false));
+            return;
           }
 
-          setResponse((prev) => prev + data);
-        }
 
-        if (streamDone) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          // Force immediate render for each token
+          flushSync(() => {
+            setResponse((prev) => prev + data);
+          });
+        }
       }
     } catch (error) {
       setError(
         error instanceof Error ? error.message : "Failed to fetch response",
       );
     } finally {
-      setIsStreaming(false);
+      flushSync(() => setIsStreaming(false));
     }
   }
 

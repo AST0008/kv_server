@@ -2,8 +2,9 @@
 # pip install git+https://github.com/huggingface/transformers.git
 # pip install accelerate
 
-import time
-from xml.parsers.expat import model
+from dataclasses import dataclass
+
+import asyncio
 
 # from aiohttp import streamer
 
@@ -18,17 +19,98 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 
 
+
 class ChatRequest(BaseModel):
     question: str
 
-app = FastAPI()
+# Request model
 
+@dataclass
+class Request:
+    id: str
+    prompt : str
+    result_queue: asyncio.Queue
+    
+    
+class InferenceEngine:
+    
+    def __init__(self, model_name:str  = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
+        self.queue = asyncio.Queue()  
+        self.pipe =   pipeline("text-generation", model=model_name, dtype=torch.bfloat16, device_map="auto", )
+        
+    async def worker(self):
+        """ Worker loop: get requests -> generate -> push tokens to result queue  -> push None sentinel to signal end of generation """
+        while True:
+            request:Request = await self.queue.get()    
+            print(f"Processing request {request.id} with prompt {request.prompt}")
+            
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "You are a friendly chatbot who always responds in the style of a pirate",
+                    },
+                    {"role": "user", "content":   request.prompt},
+                ]
+                streamer = TextIteratorStreamer(self.pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.pipe.tokenizer(prompt, return_tensors="pt").to(self.pipe.device)
+                generation_kwargs = dict(text_inputs=prompt, streamer=streamer, max_new_tokens=200)
+                
+                    
+                # New thread for generation
+                thread = Thread(target=self.pipe, kwargs=generation_kwargs)
+                thread.start()
+                
+                
+                # Push tokens to result queue 
+                for i in streamer:
+                    print(f"Token :{i}")
+                    await request.result_queue.put(i)
+                thread.join()
+                
+                
+                # Signal end of generation
+                await request.result_queue.put(None)
+                
+                
+                
+            except Exception as e:
+                await request.result_queue.put(f"Error: {str(e)}")
+                await request.result_queue.put(None)
+                print(f"Error processing request {request.id}: {e}")      
+                
+            finally:
+                self.queue.task_done()
+                
+    async def submit(self, prompt:str, request_id:str, ):
+        """ Submit request and yield tokens from the result queue """
+        result_queue = asyncio.Queue()
+        
+        
+        request = Request(id=request_id, prompt=prompt, result_queue=result_queue)
+  
+        await self.queue.put(request)
+        
+        while True:
+            token = await result_queue.get()
+            if token is None:
+                break
+            yield token
+
+
+app = FastAPI()
+engine = InferenceEngine()
+
+
+# Allow CORS 
 origins = [
     "http://localhost.tiangolo.com",
     "https://localhost.tiangolo.com",
     "http://localhost:5173",
     "http://localhost:8080",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,70 +122,17 @@ app.add_middleware(
 
 
 
-
-prompts  = [
-    "What is the meaning of life?",
-    "What is the airspeed of a laden swallow?",
-    "What is the answer to the Ultimate Question of Life, The Universe, and Everything?",
-        "What is the capital of Assyria?",
-  "Who is hte best football player in the world?",
-  "What is the best way to learn Python?",
-  "What is the best way to learn machine learning?",
-  "What is the best way to learn deep learning?",
-  "What is the best way to learn natural language processing?",
-  "What is the best way to learn computer vision?",
-  "What is the best way to learn reinforcement learning?",
-]
-
-pipe = pipeline("text-generation", model="TinyLlama/TinyLlama-1.1B-Chat-v1.0", dtype=torch.bfloat16, device_map="auto", )
-
-# We use the tokenizer's chat template to format each message - see https://huggingface.co/docs/transformers/main/en/chat_templating
-messages = [
-    {
-        "role": "system",
-        "content": "You are a friendly chatbot who always responds in the style of a pirate",
-    },
-    {"role": "user", "content":     "What is the meaning of life?"},
-]
-
-streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
-prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-
-inputs = pipe.tokenizer(prompt, return_tensors="pt").to(pipe.device)
-
-generation_kwargs = dict(text_inputs=messages, streamer=streamer, max_new_tokens=200)
-thread = Thread(target=pipe, kwargs=generation_kwargs)
-thread.start()
-for new_token in streamer:
-        # print(new_token, end="", flush=True)
-        pass
-thread.join()
-
-async def chat(question: str):
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly chatbot who always responds in the style of a pirate",
-        },
-        {"role": "user", "content":     question},
-    ]
-    streamer = TextIteratorStreamer(pipe.tokenizer, skip_prompt=True, skip_special_tokens=True)
-    prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = pipe.tokenizer(prompt, return_tensors="pt").to(pipe.device)
-    generation_kwargs = dict(text_inputs=messages, streamer=streamer, max_new_tokens=200)
-    thread = Thread(target=pipe, kwargs=generation_kwargs)
-    thread.start()
-    for new_token in streamer:
-        yield new_token
-    thread.join()
-
-
+#SSE - Server-Sent Events 
 async def chat_sse(question: str):
-    async for new_token in chat(question):
+    async for new_token in engine.submit(question, "default_id"):
         yield f"data: {new_token}\n\n"
     yield "data: [DONE]\n\n"
-    
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Start the inference engine worker
+    asyncio.create_task(engine.worker())
     
 @app.get("/")
 async def root():
@@ -117,41 +146,3 @@ async def main(payload: ChatRequest):
     
 
 
-# latencies = []
-
-# for prompt in prompts:
-#     messages = [
-#         {
-#             "role": "system",
-#             "content": "You are a friendly chatbot who always responds in the style of a pirate",
-#         },
-#         {"role": "user", "content": prompt},
-#     ]
-#     prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-#     start = time.time()
-#     outputs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
-#     end = time.time()
-    
-#     latency  = end - start
-#     latencies.append(latency)
-#     print(f"Request done in {latency:.2f}s")
-
-#     print(f"Latency: {latency}")
-#     print(outputs[0]["generated_text"])
-    
-# print(f"Average latency: {sum(latencies) / len(latencies):.2f}s")
-# print(f"Min: {min(latencies):.2f}s")
-# print(f"Max: {max(latencies):.2f}s")
-    
-    
-
-# with open("latencies.txt", "w") as f:
-#     f.write(f"Date: {time.strftime('%Y-%m-%d')}\n")
-#     f.write(f"Model: TinyLlama-1.1B\n")
-#     f.write(f"Test: 10 sequential requests\n\n")
-#     for i, l in enumerate(latencies):
-#         f.write(f"Request {i+1}: {l:.2f}s\n")
-#     f.write(f"\nAverage latency: {sum(latencies) / len(latencies):.2f}s\n")
-#     f.write(f"Min: {min(latencies):.2f}s\n")
-#     f.write(f"Max: {max(latencies):.2f}s\n")
-    
