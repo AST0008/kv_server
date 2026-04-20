@@ -20,7 +20,7 @@ function App() {
       setResponse("");
       flushSync(() => setIsStreaming(true));
 
-      const res = await fetch("http://localhost:8000/chat", {
+      const res = await fetch("http://localhost:8000/generate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -62,7 +62,6 @@ function App() {
             flushSync(() => setIsStreaming(false));
             return;
           }
-
 
           await new Promise((resolve) => setTimeout(resolve, 10));
           // Force immediate render for each token

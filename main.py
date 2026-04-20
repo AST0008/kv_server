@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-NUM_WORKERS = 1  # RTX 4050 6GB — only one pipeline fits safely
+NUM_WORKERS = 1  
 
 class ChatRequest(BaseModel):
     question: str
