@@ -115,7 +115,7 @@ async def main():
 
     print("\nSaved to baseline_results.csv")
     # in test.py — update the summary note
-    print("\nNote: TTFT increases linearly with user number —")
-    print("User N waits for users 0..N-1 to finish.")
-    print(f"Expected total wall time for 10 users: ~{10 * 8}s")
+    # print("\nNote: TTFT increases linearly with user number —")
+    # print("User N waits for users 0..N-1 to finish.")
+    # print(f"Expected total wall time for 10 users: ~{10 * 8}s")
 asyncio.run(main())

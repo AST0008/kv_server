@@ -9,6 +9,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 NUM_WORKERS = 1  
+BATCH_SIZE = 8
+BATCH_WAIT_TIME = 0.05
 
 class ChatRequest(BaseModel):
     question: str
@@ -33,66 +35,103 @@ class InferenceEngine:
             device_map="auto"
         )
         print("Pipeline loaded.")
+        
+        
+    async def collect_batch(self):
+        """
+        wait for first req (blocking)
+        collect more requests till time
+        return batch upto batch_size requests
+        """
+        first = await self.queue.get()
+        batch = [first]
+        
+        # wait for more requests to batch up
+        deadline = asyncio.get_event_loop().time() + BATCH_WAIT_TIME
+        
+        while len(batch) < BATCH_SIZE:
+            timeout = deadline - asyncio.get_event_loop().time()
+            if timeout <= 0:
+                break
+            try:
+                req = await asyncio.wait_for(self.queue.get(), timeout)
+                batch.append(req)
+            except asyncio.TimeoutError:
+                break
+            
+        print(f"Collected batch of {len(batch)} requests")
+        return batch
 
     async def worker(self):
         print("Worker started")
         loop = asyncio.get_event_loop()
 
         while True:
-            request: Request = await self.queue.get()
-            print(f"Processing {request.id}")
+            # request: Request = await self.queue.get()
+            batch = await self.collect_batch()
+            
+            print(f"Processing batch of {len(batch)} requests")
+            # print(f"Processing {request.id} ")
             try:
-                messages = [
-                    {"role": "system", "content": "You are a pirate chatbot."},
-                    {"role": "user", "content": request.prompt},
-                ]
-                streamer = TextIteratorStreamer(
-                    self.pipe.tokenizer,
-                    skip_prompt=True,
-                    skip_special_tokens=True
-                )
-                prompt = self.pipe.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                generation_kwargs = dict(
-                    text_inputs=prompt,
-                    streamer=streamer,
-                    max_new_tokens=200,
-                    return_full_text=False
-                )
+                prompts = []
+                
+                
+                for request in batch:
+                    messages  = [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": request.prompt}
+                    ]
+                    
+                    prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    prompts.append(prompt)
 
-                def run_generation():
-                    # no inner thread — run pipeline directly in executor
+                def run_batch_generation(prompts=prompts,batch = batch):
+                      # no inner thread — run pipeline directly in executor
                     # streamer yields tokens as they generate
-                    import threading
-                    gen = threading.Thread(
-                        target=self.pipe,
-                        kwargs=generation_kwargs
-                    )
-                    gen.start()
-                    for token in streamer:
+                    # import threading
+                    # gen = threading.Thread(
+                    #     target=self.pipe,
+                    #     kwargs=generation_kwargs
+                    # )
+                    # gen.start()
+                    # for token in streamer:
+                    #     loop.call_soon_threadsafe(
+                    #         request.result_queue.put_nowait, token
+                    #     )
+                    # gen.join()
+                    # loop.call_soon_threadsafe(
+                    #     request.result_queue.put_nowait, None
+                    # )
+                    print(f"Running GPU batch: {len(prompts)} prompts")
+                    outputs = self.pipe(prompts, max_new_tokens=200, return_full_text=False, batch_size=len(prompts),pad_token_id=self.pipe.tokenizer.eos_token_id) 
+                    
+                    for request, output in zip(batch, outputs):
+                        generated_text = output[0]["generated_text"]
                         loop.call_soon_threadsafe(
-                            request.result_queue.put_nowait, token
+                            request.result_queue.put_nowait, generated_text
                         )
-                    gen.join()
-                    loop.call_soon_threadsafe(
-                        request.result_queue.put_nowait, None
-                    )
+                        loop.call_soon_threadsafe(
+                            request.result_queue.put_nowait, None
+                        )
+                    print(f"Batch complete")
+
 
                 # fire into executor — worker immediately free for next request
                 # asyncio.ensure_future(
                 #     loop.run_in_executor(executor, run_generation)
                 # )
-                await loop.run_in_executor(executor, run_generation)
+                await loop.run_in_executor(executor, run_batch_generation)
 
             except Exception as e:
                 print(f"Error: {e}")
-                request.result_queue.put_nowait(None)
+                for request in batch:
+                    request.result_queue.put_nowait(f"Error: {e}")
+                    request.result_queue.put_nowait(None)
             finally:
-                self.queue.task_done()
+                for _ in batch:
+                    self.queue.task_done()
 
+        
     async def submit(self, prompt: str, request_id: str):
         result_queue = asyncio.Queue()
         request = Request(
