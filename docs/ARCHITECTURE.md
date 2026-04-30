@@ -1,51 +1,109 @@
-# Architecture Overview
+# Architecture
 
-## 1) Components
+## Overview
 
-### Backend (`main.py`)
+A minimal LLM inference server built from scratch to understand
+the core systems challenges in production model serving.
 
-- **FastAPI app** exposes:
-  - `GET /` health-ish route
-  - `POST /generate` chat route
-- **Chat request model** (`ChatRequest`) validates JSON payload (`question: str`).
-- **LLM pipeline** is created once at startup using Hugging Face `transformers.pipeline`.
-- **Streaming generator**:
-  - `chat(question)` yields generated text token chunks.
-  - `chat_sse(question)` wraps chunks as SSE frames (`data: ...\n\n`) and emits `[DONE]`.
-- **CORS middleware** allows local frontend origins.
+## Components
 
-### Frontend (`frontend/src/App.tsx`)
+### InferenceEngine
 
-- **Input state** stores user question text.
-- **Request state** tracks streaming state and errors.
-- **SSE parser** reads `fetch(...).body` stream, splits by SSE event boundary (`\n\n`), extracts `data:` lines, and appends content to response state.
-- **UI** shows a prompt form and live response area.
+The core class. Owns the request queue, the model pipeline,
+and the batch scheduler. Single instance shared across all
+FastAPI request handlers.
 
-## 2) Connection Flow
+### Request Queue (asyncio.Queue)
 
-1. User enters prompt in React UI and submits form.
-2. Frontend sends `POST http://localhost:8000/generate` with JSON body.
-3. FastAPI validates body, calls `chat_sse(question)`.
-4. Backend model generates text incrementally; each chunk is emitted as SSE `data:` event.
-5. Frontend stream reader receives chunks and updates response text live.
-6. Backend sends `data: [DONE]` to signal completion.
+Incoming HTTP requests are converted to Request objects and
+placed in an asyncio.Queue. This decouples HTTP handling from
+GPU execution — FastAPI can accept new connections while the
+GPU is busy with the current batch.
 
-## 3) Runtime Boundaries
+### Batch Scheduler (collect_batch)
 
-- **Browser boundary**: React app in Vite dev server (`:5173`).
-- **API boundary**: FastAPI app (`:8000`).
-- **Model boundary**: Transformers pipeline running in backend Python process.
+Waits for the first request, then collects additional requests
+for up to 50ms or until batch_size=8 is reached. Flushes the
+batch to the GPU regardless of fill level when the timer expires.
 
-## 4) Current Tradeoffs (Basic)
+Tradeoff: longer wait = fuller batches = better GPU utilization
+but higher latency. 50ms is a reasonable default for interactive
+use cases.
 
-- Single-process backend; no queue or worker isolation.
-- In-memory request handling only; no persistence layer.
-- Frontend uses manual SSE parsing with `fetch` stream (works well for POST body use-case).
-- Local CORS allowlist is development-focused.
+### Model Runner (run_batch_generation)
 
-## 5) Possible Next Steps
+Runs in a ThreadPoolExecutor to avoid blocking the asyncio event
+loop. Passes all prompts in the batch to the HuggingFace pipeline
+simultaneously. The pipeline handles padding internally.
 
-- Add request cancellation support (`AbortController`) in frontend.
-- Add auth/rate limits on backend.
-- Add observability (request IDs, latency metrics, structured logs).
-- Move model serving behind a dedicated inference service if scale grows.
+Outputs are routed back to each request's individual result_queue
+via call_soon_threadsafe, which safely bridges the sync executor
+thread back to the async event loop.
+
+### SSE Streaming
+
+Each request has its own asyncio.Queue (result_queue). The
+submit() generator drains this queue and yields tokens as they
+arrive. FastAPI's StreamingResponse forwards these to the client
+as Server-Sent Events.
+
+### /metrics Endpoint
+
+Exposes real-time server state: active requests, queue depth,
+batch size, total requests processed, total tokens generated,
+and KV cache memory estimation based on TinyLlama-1.1B's
+architecture constants.
+
+## Request Lifecycle
+
+POST /generate
+|
+▼
+FastAPI handler
+Creates Request(id, prompt, result_queue)
+Adds to engine.queue
+Returns StreamingResponse
+|
+▼
+collect_batch()
+Waits up to 50ms for batch to fill
+Returns list of 1-8 Requests
+|
+▼
+run_batch_generation() [in ThreadPoolExecutor]
+Builds prompts list
+Calls pipeline(prompts, batch_size=N)
+GPU processes all N sequences in one forward pass
+Routes generated text to each request's result_queue
+|
+▼
+submit() generator
+Drains result_queue as tokens arrive
+Yields SSE formatted chunks
+|
+▼
+Client receives streaming response
+
+## Known Limitations
+
+**No per-request streaming**
+Full response delivered at once rather than token by token.
+Fix: implement TextIteratorStreamer per request with token
+demultiplexing.
+
+**No KV cache management**
+Memory pressure estimated but not actively managed. Under
+sustained load with long sequences, GPU memory could fill
+without graceful degradation.
+Fix: implement block-based KV cache management (see PagedAttention).
+
+**No request timeout or backpressure**
+Requests queue indefinitely. Under extreme load, queue depth
+grows unbounded.
+Fix: add per-request timeout (408) and max queue depth (429/503).
+
+**Single worker**
+Hardware constraint — RTX 4050 6GB can only fit one
+TinyLlama pipeline instance.
+Fix: larger GPU allows multiple pipeline instances for true
+parallel execution.
