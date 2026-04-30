@@ -24,7 +24,7 @@ async def single_request(session, user_id):
                         break
                     if first_token_time is None:
                         first_token_time = time.time()
-                    token_count += 1
+                    token_count += len(token.split())
 
         ttft = round(first_token_time - start, 3) if first_token_time else None
         total = round(time.time() - start, 3)
