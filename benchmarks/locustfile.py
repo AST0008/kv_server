@@ -1,10 +1,11 @@
-from locust import HttpUser, task, between, events, constant
+from pathlib import Path
+from locust import HttpUser, task, events, constant
 import csv
-import asyncio
 import time
 
 ttft_list = []
 latency_list = []
+RESULTS_PATH = Path(__file__).resolve().parent / "baseline_results.csv"
 
 
 # instial benchmarking code for locust load testing
@@ -58,7 +59,7 @@ def write_results(environment, **kwargs):
     avg_latency = sum(latency_list) / len(latency_list)
     rps = environment.stats.total.current_rps
 
-    with open("baseline_results.csv", "a") as f:
+    with open(RESULTS_PATH, "a") as f:
         writer = csv.writer(f)
         writer.writerow([
             "users", "avg_ttft", "avg_latency", "rps"

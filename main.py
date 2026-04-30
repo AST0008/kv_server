@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import asyncio
 import torch
+import uvicorn
 from transformers import pipeline, TextIteratorStreamer
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -177,3 +178,7 @@ async def main(payload: ChatRequest):
         chat_sse(payload.question),
         media_type="text/event-stream"
     )
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

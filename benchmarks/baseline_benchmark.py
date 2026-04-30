@@ -1,10 +1,12 @@
 import asyncio
+from pathlib import Path
 import aiohttp
 import time
 
 SERVER_URL = "http://localhost:8000"
 PROMPT = "What is Artificial Intelligence?"
 TIMEOUT = aiohttp.ClientTimeout(total=300)  # 5 min — sequential queue can be slow
+RESULTS_PATH = Path(__file__).resolve().parent / "baseline_results.csv"
 
 async def single_request(session, user_id):
     start = time.time()
@@ -92,7 +94,7 @@ async def main():
 
     # save to csv
     import csv
-    with open("baseline_results.csv", "w", newline="") as f:
+    with open(RESULTS_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "users", "successful", "avg_ttft",
             "avg_latency", "avg_tokens", "throughput_rps"
@@ -113,8 +115,8 @@ async def main():
             f"{r['throughput_rps']}"
         )
 
-    print("\nSaved to baseline_results.csv")
-    # in test.py — update the summary note
+    print(f"\nSaved to {RESULTS_PATH}")
+    # in baseline_benchmark.py — update the summary note
     # print("\nNote: TTFT increases linearly with user number —")
     # print("User N waits for users 0..N-1 to finish.")
     # print(f"Expected total wall time for 10 users: ~{10 * 8}s")

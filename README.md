@@ -7,10 +7,10 @@ Minimal local chat app with:
 
 ## Project Structure
 
-- `main.py` — FastAPI app and `/chat` SSE endpoint
+- `main.py` — FastAPI app and `/generate` SSE endpoint
 - `frontend/` — React client
 - `docs/ARCHITECTURE.md` — component and data-flow overview
-- `latencies.txt` — optional local benchmark output
+- `benchmarks/` — benchmark scripts and outputs
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ Open `http://localhost:5173`.
 
 ## API (Current)
 
-### `POST /chat`
+### `POST /generate`
 
 Request body:
 
@@ -60,3 +60,27 @@ Response:
 - CORS currently allows local frontend origins.
 - Model is loaded once at startup in `main.py`.
 - This README is intentionally a skeleton; extend with deployment and env setup as needed.
+
+## Benchmarks
+
+![Throughput and wall time comparison](benchmark_comparison.png)
+
+Benchmark details and raw outputs live in [benchmarks/baseline.md](benchmarks/baseline.md).
+
+Run the baseline benchmark:
+
+```bash
+python benchmarks/baseline_benchmark.py
+```
+
+Run locust:
+
+```bash
+locust -f benchmarks/locustfile.py
+```
+
+Regenerate the plot:
+
+```bash
+python benchmarks/plot_benchmarks.py
+```

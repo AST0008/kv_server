@@ -17,14 +17,14 @@ each user waits for all previous requests to complete.
 Sequential throughput stays flat at ~0.1 req/s per request.
 Wall time for 10 users: 38.49s
 
-## Naive Batching Benchmark
+## Naive Batching Benchmark (batch_size = 8, wait = 50ms)
 
 Model: TinyLlama-1.1B-Chat
 Hardware: NVIDIA RTX 4050 6GB
 Max tokens: 200
 Prompt: "What is Artificial Intelligence?"
 
-## Final Summary
+### Final Summary
 
 | Users | Success | TTFT  | Latency | Tokens | RPS   |
 | ----- | ------- | ----- | ------- | ------ | ----- |
@@ -41,3 +41,6 @@ Prompt: "What is Artificial Intelligence?"
 Wall time for 10 users:
 Baseline: 38.49s
 Batched: 6.93s → 5.6x faster
+
+
+    

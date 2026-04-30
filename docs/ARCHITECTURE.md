@@ -6,7 +6,7 @@
 
 - **FastAPI app** exposes:
   - `GET /` health-ish route
-  - `POST /chat` chat route
+  - `POST /generate` chat route
 - **Chat request model** (`ChatRequest`) validates JSON payload (`question: str`).
 - **LLM pipeline** is created once at startup using Hugging Face `transformers.pipeline`.
 - **Streaming generator**:
@@ -24,7 +24,7 @@
 ## 2) Connection Flow
 
 1. User enters prompt in React UI and submits form.
-2. Frontend sends `POST http://localhost:8000/chat` with JSON body.
+2. Frontend sends `POST http://localhost:8000/generate` with JSON body.
 3. FastAPI validates body, calls `chat_sse(question)`.
 4. Backend model generates text incrementally; each chunk is emitted as SSE `data:` event.
 5. Frontend stream reader receives chunks and updates response text live.
