@@ -10,6 +10,20 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import time
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    ConsoleSpanExporter
+)
+
+# OpenTelemetry setup
+provider = TracerProvider()
+processor = BatchSpanProcessor(ConsoleSpanExporter())
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
 NUM_WORKERS = 1  
 
 # Higher = better GPU utilization, high memory usage, but more latency for small batches
@@ -97,62 +111,71 @@ class InferenceEngine:
             print(f"Processing batch of {len(batch)} requests")
             # print(f"Processing {request.id} ")
             
-            # update stats 
-            self.stats.queue_depth = self.queue.qsize()
-            self.stats.current_batch_size = len(batch)
-            self.stats.active_requests += len(batch)
+            with tracer.start_as_current_span("batch_execute") as span:
+                span.set_attribute("batch.size", len(batch))
+                span.set_attribute("queue.depth", self.queue.qsize())
+                
+                
+                # update stats 
+                self.stats.queue_depth = self.queue.qsize()
+                self.stats.current_batch_size = len(batch)
+                self.stats.active_requests += len(batch)
             
-            try:
-                prompts = []
                 
+                try:
+                    prompts = []
+                    
+                    
+                    for request in batch:
+                        messages  = [
+                            {"role": "system", "content": "You are a helpful assistant."},
+                            {"role": "user", "content": request.prompt}
+                        ]
+                        
+                        prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        prompts.append(prompt)
+
+                    def run_batch_generation(prompts=prompts,batch = batch):
+                        
+                        total_tokens = 0
+                        batch_start = time.time()
+                        
+                        print(f"Running GPU batch: {len(prompts)} prompts")
+                        outputs = self.pipe(prompts, max_new_tokens=200, return_full_text=False, batch_size=len(prompts),pad_token_id=self.pipe.tokenizer.eos_token_id) 
+                        
+                        for request, output in zip(batch, outputs):
+                            generated_text = output[0]["generated_text"]
+                            
+                            token_count = len(self.pipe.tokenizer(generated_text,add_special_tokens=False).input_ids)
+                            total_tokens += token_count
+                            
+                            loop.call_soon_threadsafe(
+                                request.result_queue.put_nowait, generated_text
+                            )
+                            loop.call_soon_threadsafe(
+                                request.result_queue.put_nowait, None
+                            )
+                            
+                        loop.call_soon_threadsafe(
+                            self._update_after_batch, len(batch), total_tokens,time.time() - batch_start
+                        )
+                        
+                        print(f"Batch complete")
+
+                    await loop.run_in_executor(executor, run_batch_generation)
+
+                except Exception as e:
+                    print(f"Error: {e}")
+                    for request in batch:
+                        request.result_queue.put_nowait(f"Error: {e}")
+                        request.result_queue.put_nowait(None)
+                    self.stats.active_requests -= len(batch)   
+                finally:
+                    for _ in batch:
+                        self.queue.task_done()
                 
-                for request in batch:
-                    messages  = [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": request.prompt}
-                    ]
-                    
-                    prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    prompts.append(prompt)
 
-                def run_batch_generation(prompts=prompts,batch = batch):
-                    
-                    total_tokens = 0
-                    batch_start = time.time()
-                    
-                    print(f"Running GPU batch: {len(prompts)} prompts")
-                    outputs = self.pipe(prompts, max_new_tokens=200, return_full_text=False, batch_size=len(prompts),pad_token_id=self.pipe.tokenizer.eos_token_id) 
-                    
-                    for request, output in zip(batch, outputs):
-                        generated_text = output[0]["generated_text"]
-                        
-                        token_count = len(self.pipe.tokenizer(generated_text,add_special_tokens=False).input_ids)
-                        total_tokens += token_count
-                        
-                        loop.call_soon_threadsafe(
-                            request.result_queue.put_nowait, generated_text
-                        )
-                        loop.call_soon_threadsafe(
-                            request.result_queue.put_nowait, None
-                        )
-                        
-                    loop.call_soon_threadsafe(
-                        self._update_after_batch, len(batch), total_tokens,time.time() - batch_start
-                    )
-                    
-                    print(f"Batch complete")
 
-                await loop.run_in_executor(executor, run_batch_generation)
-
-            except Exception as e:
-                print(f"Error: {e}")
-                for request in batch:
-                    request.result_queue.put_nowait(f"Error: {e}")
-                    request.result_queue.put_nowait(None)
-                self.stats.active_requests -= len(batch)   
-            finally:
-                for _ in batch:
-                    self.queue.task_done()
 
     def _update_after_batch(self, batch_size, tokens, duration):
         self.stats.active_requests -= batch_size
@@ -240,6 +263,9 @@ async def root():
 
 @app.post("/generate")
 async def main(payload: ChatRequest):
+    
+    with tracer.start_as_current_span("http_request") as span:
+        span.set_attribute("prompt.length", len(payload.question))
     return StreamingResponse(
         chat_sse(payload.question),
         media_type="text/event-stream"
