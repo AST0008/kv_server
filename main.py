@@ -4,7 +4,7 @@ import asyncio
 import torch
 import uvicorn
 from transformers import pipeline, TextIteratorStreamer
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -37,6 +37,9 @@ KV_LAYERS = 22
 KV_HEADS = 32
 KV_HEAD_DIM = 64
 KV_BYTES_PER_VALUE = 2  # bfloat16
+
+MAX_QUEUE_DEPTH = 20      # reject with 503 if queue exceeds this
+REQUEST_TIMEOUT_S = 30    # reject with 408 if waiting longer than this
 
 class ChatRequest(BaseModel):
     question: str
@@ -185,6 +188,11 @@ class InferenceEngine:
         self.stats.current_batch_size = 0  
         
     async def submit(self, prompt: str, request_id: str):
+        
+        if self.queue.qsize() >= MAX_QUEUE_DEPTH:
+            raise HTTPException(status_code=503,
+            detail=f"Server overloaded. Queue depth: {self.queue.qsize()}")
+        
         result_queue = asyncio.Queue()
         request = Request(
             id=request_id,
@@ -192,11 +200,25 @@ class InferenceEngine:
             result_queue=result_queue
         )
         await self.queue.put(request)
-        while True:
-            token = await result_queue.get()
-            if token is None:
-                break
-            yield token
+        try:
+            async def generate_with_timeout():
+                while True:
+                    token = await asyncio.wait_for(
+                        result_queue.get(),
+                        timeout=REQUEST_TIMEOUT_S
+                    )
+                    if token is None:
+                        break
+                    yield token
+
+            async for token in generate_with_timeout():
+                yield token
+
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=408,
+                detail="Request timed out waiting for generation"
+            )
 
     def get_kv_cache_stats(self) -> dict:
         """
@@ -272,12 +294,16 @@ async def main(payload: ChatRequest):
     )
 
 @app.get("/metrics")
-async def get_metrics():
+async def metrics():
     kv_stats = engine.get_kv_cache_stats()
     return {
         "server": {
             "active_requests": engine.stats.active_requests,
             "queue_depth": engine.queue.qsize(),
+            "queue_capacity": MAX_QUEUE_DEPTH,
+            "queue_utilization_pct": round(
+                engine.queue.qsize() / MAX_QUEUE_DEPTH * 100, 1
+            ),
             "current_batch_size": engine.stats.current_batch_size,
             "total_requests_processed": engine.stats.total_requests_processed,
             "total_tokens_generated": engine.stats.total_tokens_generated,
@@ -287,11 +313,12 @@ async def get_metrics():
         "config": {
             "batch_size": BATCH_SIZE,
             "batch_wait_ms": BATCH_WAIT_TIME * 1000,
+            "max_queue_depth": MAX_QUEUE_DEPTH,
+            "request_timeout_s": REQUEST_TIMEOUT_S,
             "max_new_tokens": 200,
-            "model": "TinyLlama-1.1B-Chat-v1.0"
+            "model": "TinyLlama-1.1B-Chat-v1.0",
         }
     }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

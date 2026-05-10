@@ -85,7 +85,7 @@ async def main():
     print(f"Prompt: '{PROMPT}'")
 
     results = []
-    for n in [1, 5, 10]:
+    for n in [1, 5, 10, 25]:
         result = await load_test(n)
         if result:
             results.append(result)
