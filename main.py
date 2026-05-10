@@ -152,9 +152,16 @@ class InferenceEngine:
                             token_count = len(self.pipe.tokenizer(generated_text,add_special_tokens=False).input_ids)
                             total_tokens += token_count
                             
-                            loop.call_soon_threadsafe(
-                                request.result_queue.put_nowait, generated_text
-                            )
+                            
+                            
+                            words = generated_text.split(" ")
+                            for i, word in enumerate(words):
+                                loop.call_soon_threadsafe(
+                                    request.result_queue.put_nowait, word + " "
+                                )
+                                if i % 3 == 0:  # small pause every 3 words
+                                    time.sleep(0.01)
+                                    
                             loop.call_soon_threadsafe(
                                 request.result_queue.put_nowait, None
                             )
