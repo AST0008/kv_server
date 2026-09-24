@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import asyncio
 import torch
 import uvicorn
-from transformers import pipeline, TextIteratorStreamer
+from transformers import pipeline
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -62,6 +62,58 @@ class ServerStats:
 
 # one executor thread per worker
 executor = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+
+
+class BatchTokenStreamer:
+    """Push each new token to that request's queue during model.generate.
+
+    HuggingFace TextIteratorStreamer rejects batch size > 1. This keeps the
+    existing batch and still streams token text instead of waiting for the
+    full 200-token string.
+    """
+
+    def __init__(self, tokenizer, batch, loop):
+        self.tokenizer = tokenizer
+        self.batch = batch
+        self.loop = loop
+        self._skip_prompt = True
+        self._caches = [[] for _ in batch]
+        self._printed = ["" for _ in batch]
+
+    def put(self, value):
+        if value.dim() == 1:
+            value = value.unsqueeze(0)
+        if self._skip_prompt:
+            self._skip_prompt = False
+            return
+
+        for i in range(value.shape[0]):
+            self._caches[i].extend(value[i].tolist())
+            decoded = self.tokenizer.decode(
+                self._caches[i], skip_special_tokens=True
+            )
+            # Byte-level tokens can be incomplete until the next id arrives.
+            if decoded.endswith("\ufffd"):
+                continue
+            delta = decoded[len(self._printed[i]):]
+            self._printed[i] = decoded
+            if delta:
+                self.loop.call_soon_threadsafe(
+                    self.batch[i].result_queue.put_nowait, delta
+                )
+
+    def end(self):
+        for i, request in enumerate(self.batch):
+            leftover = self._printed[i]
+            decoded = self.tokenizer.decode(
+                self._caches[i], skip_special_tokens=True
+            )
+            delta = decoded[len(leftover):]
+            if delta:
+                self.loop.call_soon_threadsafe(
+                    request.result_queue.put_nowait, delta
+                )
+            self.loop.call_soon_threadsafe(request.result_queue.put_nowait, None)
 
 class InferenceEngine:
     def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
@@ -138,39 +190,41 @@ class InferenceEngine:
                         prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         prompts.append(prompt)
 
-                    def run_batch_generation(prompts=prompts,batch = batch):
-                        
-                        total_tokens = 0
+                    def run_batch_generation(prompts=prompts, batch=batch):
+                        tokenizer = self.pipe.tokenizer
+                        model = self.pipe.model
+                        if tokenizer.pad_token_id is None:
+                            tokenizer.pad_token = tokenizer.eos_token
+
                         batch_start = time.time()
-                        
                         print(f"Running GPU batch: {len(prompts)} prompts")
-                        outputs = self.pipe(prompts, max_new_tokens=200, return_full_text=False, batch_size=len(prompts),pad_token_id=self.pipe.tokenizer.eos_token_id) 
-                        
-                        for request, output in zip(batch, outputs):
-                            generated_text = output[0]["generated_text"]
-                            
-                            token_count = len(self.pipe.tokenizer(generated_text,add_special_tokens=False).input_ids)
-                            total_tokens += token_count
-                            
-                            
-                            
-                            words = generated_text.split(" ")
-                            for i, word in enumerate(words):
-                                loop.call_soon_threadsafe(
-                                    request.result_queue.put_nowait, word + " "
-                                )
-                                if i % 3 == 0:  # small pause every 3 words
-                                    time.sleep(0.01)
-                                    
-                            loop.call_soon_threadsafe(
-                                request.result_queue.put_nowait, None
-                            )
-                            
-                        loop.call_soon_threadsafe(
-                            self._update_after_batch, len(batch), total_tokens,time.time() - batch_start
+
+                        encoded = tokenizer(
+                            prompts, return_tensors="pt", padding=True
                         )
-                        
-                        print(f"Batch complete")
+                        device = next(model.parameters()).device
+                        encoded = {k: v.to(device) for k, v in encoded.items()}
+                        prompt_len = encoded["input_ids"].shape[1]
+
+                        streamer = BatchTokenStreamer(tokenizer, batch, loop)
+                        outputs = model.generate(
+                            **encoded,
+                            max_new_tokens=200,
+                            pad_token_id=tokenizer.eos_token_id,
+                            streamer=streamer,
+                        )
+
+                        new_tokens = outputs[:, prompt_len:]
+                        total_tokens = int(
+                            (new_tokens != tokenizer.pad_token_id).sum().item()
+                        )
+                        loop.call_soon_threadsafe(
+                            self._update_after_batch,
+                            len(batch),
+                            total_tokens,
+                            time.time() - batch_start,
+                        )
+                        print("Batch complete")
 
                     await loop.run_in_executor(executor, run_batch_generation)
 
