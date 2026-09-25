@@ -30,6 +30,10 @@ Wall time for 10 concurrent users: **38.5s → 6.9s**
 
 ![Benchmark Comparison](benchmark_comparison.png)
 
+These numbers are from the earlier window batch (collect, then one
+`pipeline()` call). See `benchmarks/baseline.md`. They have not been
+re-run on the prefill/decode loop described below.
+
 ---
 
 ## Architecture
@@ -51,14 +55,21 @@ Waits 50ms or until batch_size=8
       │
       ▼
 GPU Forward Pass (ThreadPoolExecutor)
-TinyLlama-1.1B via HuggingFace pipeline
-Processes all requests simultaneously
+TinyLlama-1.1B via HuggingFace
+Processes the current batch together
       │
       ▼
 SSE Token Stream
 Each request has isolated result_queue
 Tokens streamed via Server-Sent Events
 ```
+
+Since the step loop, the scheduler is not sealed for the whole
+generation. When the GPU is idle it still waits 50ms and stops at 8.
+While requests are already decoding, it takes anyone waiting if a
+seat is free, prefills them, and includes them on the next token.
+503 is returned when the queue depth is already 20. Each request
+streams token text as it is decoded, then `data: [DONE]`.
 
 ---
 
@@ -70,6 +81,10 @@ Batching amortizes the fixed overhead (kernel launch, memory
 allocation) across multiple sequences, keeping GPU utilization
 high. Measured 5.5x throughput improvement on this hardware.
 
+The current loop admits new requests between tokens, instead of
+holding the batch closed until `pipeline()` returned. A new arrival
+can join a batch that is already generating, up to 8 sequences.
+
 **Why asyncio.Queue for request management?**
 Decouples HTTP handling from GPU execution. FastAPI accepts
 new connections while the GPU is busy, rather than blocking
@@ -77,11 +92,15 @@ the entire server on each generation. The queue also enables
 backpressure — reject requests gracefully when overloaded
 rather than accepting unbounded load.
 
+Each request also has a private `result_queue`. The shared queue
+is only the waiting room. One client never receives another
+client's tokens.
+
 **Why ThreadPoolExecutor for generation?**
-HuggingFace pipeline is synchronous. Running it directly in
+The model forward is synchronous. Running it directly in
 an async context would block the event loop, preventing FastAPI
-from handling other requests. The executor runs generation in
-a thread while the event loop stays free.
+from handling other requests. The executor runs prefill and
+each decode step in a thread while the event loop stays free.
 
 **Why call_soon_threadsafe for token routing?**
 Bridges the sync executor thread back to the async event loop
@@ -96,6 +115,11 @@ GPU memory appears full but is actually wasted. PagedAttention
 treats GPU memory like OS virtual memory with fixed-size pages,
 eliminating fragmentation and enabling much higher utilization.
 This is vLLM's core contribution.
+
+The step loop still left-pads shorter KV caches up to the longest
+sequence in the batch, masks that padding, then slices it off.
+`/metrics` still estimates KV (active requests × 100 tokens). It
+does not count the real bytes in each request's cache.
 
 ---
 
@@ -133,8 +157,8 @@ This is vLLM's core contribution.
 
 ```bash
 # clone
-git clone https://github.com/yourusername/llm-inference-server
-cd llm-inference-server
+git clone https://github.com/AST0008/kv_server
+cd kv_server
 
 # install
 pip install -r requirements.txt
@@ -143,7 +167,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 
 # test
-curl -X POST http://localhost:8000/generate \
+curl -N -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{"question": "What is machine learning?"}'
 
@@ -174,6 +198,10 @@ PagedAttention — my contiguous KV cache allocation causes
 fragmentation under mixed-length workloads. Understanding
 exactly why that's a problem, and what the solution looks
 like, is what this project was built to teach.
+
+The later step loop is the continuous-batching piece: membership
+can change between tokens, and tokens go out while the GPU is
+still decoding. PagedAttention is still the open gap.
 
 ---
 
