@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import time
+import traceback
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -40,6 +41,7 @@ KV_BYTES_PER_VALUE = 2  # bfloat16
 
 MAX_QUEUE_DEPTH = 20      # reject with 503 if queue exceeds this
 REQUEST_TIMEOUT_S = 30    # reject with 408 if waiting longer than this
+MAX_NEW_TOKENS = 200
 
 class ChatRequest(BaseModel):
     question: str
@@ -64,56 +66,78 @@ class ServerStats:
 executor = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 
-class BatchTokenStreamer:
-    """Push each new token to that request's queue during model.generate.
+@dataclass
+class Slot:
+    """One in-flight request. past is that row's KV only, with no padding."""
 
-    HuggingFace TextIteratorStreamer rejects batch size > 1. This keeps the
-    existing batch and still streams token text instead of waiting for the
-    full 200-token string.
-    """
+    request: Request
+    past: tuple
+    next_id: int
+    generated: list
+    printed: str = ""
+    new_count: int = 0
+    finished: bool = False
 
-    def __init__(self, tokenizer, batch, loop):
-        self.tokenizer = tokenizer
-        self.batch = batch
-        self.loop = loop
-        self._skip_prompt = True
-        self._caches = [[] for _ in batch]
-        self._printed = ["" for _ in batch]
 
-    def put(self, value):
-        if value.dim() == 1:
-            value = value.unsqueeze(0)
-        if self._skip_prompt:
-            self._skip_prompt = False
-            return
+def _legacy_layers(past):
+    """(key, value) per layer. Transformers 5.17 DynamicCache yields a third item."""
+    if hasattr(past, "to_legacy_cache"):
+        return past.to_legacy_cache()
+    if hasattr(past, "layers"):
+        return tuple((layer.keys, layer.values) for layer in past.layers)
+    return tuple((item[0], item[1]) for item in past)
 
-        for i in range(value.shape[0]):
-            self._caches[i].extend(value[i].tolist())
-            decoded = self.tokenizer.decode(
-                self._caches[i], skip_special_tokens=True
-            )
-            # Byte-level tokens can be incomplete until the next id arrives.
-            if decoded.endswith("\ufffd"):
-                continue
-            delta = decoded[len(self._printed[i]):]
-            self._printed[i] = decoded
-            if delta:
-                self.loop.call_soon_threadsafe(
-                    self.batch[i].result_queue.put_nowait, delta
+
+def _as_model_cache(legacy):
+    from transformers.cache_utils import DynamicCache
+    if hasattr(DynamicCache, "from_legacy_cache"):
+        return DynamicCache.from_legacy_cache(legacy)
+    return DynamicCache(ddp_cache_data=legacy)
+
+
+def _slice_row(legacy, index, length):
+    """Keep one batch row and the first `length` real (right-padded) positions."""
+    layers = []
+    for key, value in legacy:
+        layers.append((
+            key[index:index + 1, :, :length, :].contiguous(),
+            value[index:index + 1, :, :length, :].contiguous(),
+        ))
+    return tuple(layers)
+
+
+def _take_real_suffix(legacy, index, length):
+    """After a left-padded decode step, keep the last `length` real positions."""
+    layers = []
+    for key, value in legacy:
+        layers.append((
+            key[index:index + 1, :, -length:, :].contiguous(),
+            value[index:index + 1, :, -length:, :].contiguous(),
+        ))
+    return tuple(layers)
+
+
+def _batch_left_pad(legacies):
+    max_len = max(leg[0][0].shape[2] for leg in legacies)
+    n_layers = len(legacies[0])
+    batched = []
+    for layer_i in range(n_layers):
+        keys = []
+        values = []
+        for leg in legacies:
+            key, value = leg[layer_i]
+            pad = max_len - key.shape[2]
+            if pad:
+                zeros = torch.zeros(
+                    key.shape[0], key.shape[1], pad, key.shape[3],
+                    dtype=key.dtype, device=key.device,
                 )
-
-    def end(self):
-        for i, request in enumerate(self.batch):
-            leftover = self._printed[i]
-            decoded = self.tokenizer.decode(
-                self._caches[i], skip_special_tokens=True
-            )
-            delta = decoded[len(leftover):]
-            if delta:
-                self.loop.call_soon_threadsafe(
-                    request.result_queue.put_nowait, delta
-                )
-            self.loop.call_soon_threadsafe(request.result_queue.put_nowait, None)
+                key = torch.cat([zeros, key], dim=2)
+                value = torch.cat([zeros, value], dim=2)
+            keys.append(key)
+            values.append(value)
+        batched.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+    return tuple(batched)
 
 class InferenceEngine:
     def __init__(self, model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
@@ -155,88 +179,161 @@ class InferenceEngine:
         print(f"Collected batch of {len(batch)} requests")
         return batch
 
+    def _chat_prompt(self, request):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": request.prompt},
+        ]
+        return self.pipe.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    def _emit(self, slot, token_id, loop):
+        tokenizer = self.pipe.tokenizer
+        eos = tokenizer.eos_token_id
+        if token_id == eos or slot.new_count >= MAX_NEW_TOKENS:
+            slot.finished = True
+            loop.call_soon_threadsafe(slot.request.result_queue.put_nowait, None)
+            return
+        slot.generated.append(token_id)
+        slot.new_count += 1
+        decoded = tokenizer.decode(slot.generated, skip_special_tokens=True)
+        if not decoded.endswith("\ufffd"):
+            delta = decoded[len(slot.printed):]
+            slot.printed = decoded
+            if delta:
+                loop.call_soon_threadsafe(
+                    slot.request.result_queue.put_nowait, delta
+                )
+        slot.next_id = token_id
+        if slot.new_count >= MAX_NEW_TOKENS:
+            slot.finished = True
+            loop.call_soon_threadsafe(slot.request.result_queue.put_nowait, None)
+
+    def _prefill(self, requests, loop):
+        tokenizer = self.pipe.tokenizer
+        model = self.pipe.model
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        device = next(model.parameters()).device
+        prompts = [self._chat_prompt(request) for request in requests]
+        encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.inference_mode():
+            out = model(**encoded, use_cache=True)
+        legacy = _legacy_layers(out.past_key_values)
+        slots = []
+        for i, request in enumerate(requests):
+            length = int(encoded["attention_mask"][i].sum().item())
+            past = _slice_row(legacy, i, length)
+            token_id = int(out.logits[i, length - 1].argmax().item())
+            slot = Slot(request=request, past=past, next_id=token_id, generated=[])
+            self._emit(slot, token_id, loop)
+            slots.append(slot)
+        return slots
+
+    def _decode_step(self, slots, loop):
+        model = self.pipe.model
+        device = next(model.parameters()).device
+        running = [slot for slot in slots if not slot.finished]
+        if not running:
+            return
+        lengths = [slot.past[0][0].shape[2] for slot in running]
+        max_len = max(lengths)
+        legacy = _batch_left_pad([slot.past for slot in running])
+        input_ids = torch.tensor(
+            [[slot.next_id] for slot in running], dtype=torch.long, device=device
+        )
+        attention_mask = torch.zeros(
+            len(running), max_len + 1, dtype=torch.long, device=device
+        )
+        position_ids = torch.zeros(
+            len(running), 1, dtype=torch.long, device=device
+        )
+        for i, length in enumerate(lengths):
+            attention_mask[i, max_len - length:] = 1
+            position_ids[i, 0] = length
+        with torch.inference_mode():
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=_as_model_cache(legacy),
+                use_cache=True,
+            )
+        new_legacy = _legacy_layers(out.past_key_values)
+        for i, slot in enumerate(running):
+            slot.past = _take_real_suffix(new_legacy, i, lengths[i] + 1)
+            token_id = int(out.logits[i, -1].argmax().item())
+            self._emit(slot, token_id, loop)
+
+    def _fail(self, requests, error):
+        for request in requests:
+            request.result_queue.put_nowait(f"Error: {error}")
+            request.result_queue.put_nowait(None)
+
+    def _close_finished(self, slots):
+        still = []
+        for slot in slots:
+            if slot.finished:
+                self.stats.active_requests -= 1
+                self.stats.total_requests_processed += 1
+                self.stats.total_tokens_generated += slot.new_count
+            else:
+                still.append(slot)
+        self.stats.current_batch_size = len(still)
+        return still
+
     async def worker(self):
         print("Worker started")
         loop = asyncio.get_event_loop()
+        active = []
 
         while True:
-            # request: Request = await self.queue.get()
-            batch = await self.collect_batch()
-            
-            print(f"Processing batch of {len(batch)} requests")
-            # print(f"Processing {request.id} ")
-            
-            with tracer.start_as_current_span("batch_execute") as span:
-                span.set_attribute("batch.size", len(batch))
-                span.set_attribute("queue.depth", self.queue.qsize())
-                
-                
-                # update stats 
+            incoming = []
+            if not active:
+                incoming = await self.collect_batch()
+            else:
+                while len(active) < BATCH_SIZE:
+                    try:
+                        incoming.append(self.queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+            if incoming:
                 self.stats.queue_depth = self.queue.qsize()
-                self.stats.current_batch_size = len(batch)
-                self.stats.active_requests += len(batch)
-            
-                
+                self.stats.active_requests += len(incoming)
+                self.stats.current_batch_size = len(active) + len(incoming)
+                print(f"Admitting {len(incoming)} requests, {len(active)} already running")
                 try:
-                    prompts = []
-                    
-                    
-                    for request in batch:
-                        messages  = [
-                            {"role": "system", "content": "You are a helpful assistant."},
-                            {"role": "user", "content": request.prompt}
-                        ]
-                        
-                        prompt = self.pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        prompts.append(prompt)
-
-                    def run_batch_generation(prompts=prompts, batch=batch):
-                        tokenizer = self.pipe.tokenizer
-                        model = self.pipe.model
-                        if tokenizer.pad_token_id is None:
-                            tokenizer.pad_token = tokenizer.eos_token
-
-                        batch_start = time.time()
-                        print(f"Running GPU batch: {len(prompts)} prompts")
-
-                        encoded = tokenizer(
-                            prompts, return_tensors="pt", padding=True
-                        )
-                        device = next(model.parameters()).device
-                        encoded = {k: v.to(device) for k, v in encoded.items()}
-                        prompt_len = encoded["input_ids"].shape[1]
-
-                        streamer = BatchTokenStreamer(tokenizer, batch, loop)
-                        outputs = model.generate(
-                            **encoded,
-                            max_new_tokens=200,
-                            pad_token_id=tokenizer.eos_token_id,
-                            streamer=streamer,
-                        )
-
-                        new_tokens = outputs[:, prompt_len:]
-                        total_tokens = int(
-                            (new_tokens != tokenizer.pad_token_id).sum().item()
-                        )
-                        loop.call_soon_threadsafe(
-                            self._update_after_batch,
-                            len(batch),
-                            total_tokens,
-                            time.time() - batch_start,
-                        )
-                        print("Batch complete")
-
-                    await loop.run_in_executor(executor, run_batch_generation)
-
+                    newcomers = await loop.run_in_executor(
+                        executor, lambda reqs=incoming: self._prefill(reqs, loop)
+                    )
+                    active.extend(newcomers)
                 except Exception as e:
-                    print(f"Error: {e}")
-                    for request in batch:
-                        request.result_queue.put_nowait(f"Error: {e}")
-                        request.result_queue.put_nowait(None)
-                    self.stats.active_requests -= len(batch)   
+                    traceback.print_exc()
+                    self._fail(incoming, e)
+                    self.stats.active_requests -= len(incoming)
                 finally:
-                    for _ in batch:
+                    for _ in incoming:
                         self.queue.task_done()
+                active = self._close_finished(active)
+
+            if not active:
+                continue
+
+            try:
+                await loop.run_in_executor(
+                    executor, lambda slots=list(active): self._decode_step(slots, loop)
+                )
+            except Exception as e:
+                traceback.print_exc()
+                self._fail([slot.request for slot in active], e)
+                self.stats.active_requests -= len(active)
+                active = []
+                self.stats.current_batch_size = 0
+                continue
+            active = self._close_finished(active)
                 
 
 
