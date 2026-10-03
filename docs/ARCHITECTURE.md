@@ -30,11 +30,13 @@ Tradeoff: longer wait = fuller batches = better GPU utilization
 but higher latency. 50ms is a reasonable default for interactive
 use cases.
 
-### Model Runner (run_batch_generation)
+### Model Runner (prefill / decode)
 
 Runs in a ThreadPoolExecutor to avoid blocking the asyncio event
-loop. Passes all prompts in the batch to the HuggingFace pipeline
-simultaneously. The pipeline handles padding internally.
+loop. TinyLlama-1.1B runs through HuggingFace. KV lives in 16-token
+pages. Each decode step gathers those pages into one contiguous
+cache, runs ordinary attention, and writes back only the new token.
+HuggingFace does not read the pages.
 
 Outputs are routed back to each request's individual result_queue
 via call_soon_threadsafe, which safely bridges the sync executor
@@ -49,10 +51,9 @@ as Server-Sent Events.
 
 ### /metrics Endpoint
 
-Exposes real-time server state: active requests, queue depth,
-batch size, total requests processed, total tokens generated,
-and KV cache memory estimation based on TinyLlama-1.1B's
-architecture constants.
+Exposes the page pool: `used_blocks`, `free_blocks`, `filled_tokens`,
+and `kv_mb`, plus CUDA memory. It does not estimate KV as active
+requests times 100 tokens.
 
 ## Request Lifecycle
 
@@ -65,16 +66,20 @@ Adds to engine.queue
 Returns StreamingResponse
 |
 ▼
-collect_batch()
-Waits up to 50ms for batch to fill
-Returns list of 1-8 Requests
+reserve()
+Takes 16-token pages before the stream starts
+503 before any SSE byte if the free list cannot cover the prompt
+Second 503 if the queue is already at 20; those pages are released
 |
 ▼
-run_batch_generation() [in ThreadPoolExecutor]
-Builds prompts list
-Calls pipeline(prompts, batch_size=N)
-GPU processes all N sequences in one forward pass
-Routes generated text to each request's result_queue
+Scheduler
+GPU idle: wait 50ms, cap 8
+Already decoding: take a waiting request if a seat is free
+|
+▼
+Prefill / decode [in ThreadPoolExecutor]
+Gathers pages into one contiguous cache for HuggingFace
+Routes each token to that request's result_queue
 |
 ▼
 submit() generator
@@ -86,21 +91,15 @@ Client receives streaming response
 
 ## Known Limitations
 
-**No per-request streaming**
-Full response delivered at once rather than token by token.
-Fix: implement TextIteratorStreamer per request with token
-demultiplexing.
+**Attention still reads a contiguous copy**
+Each decode step gathers pages into one cache for HuggingFace
+and writes back only the new token. The attention kernel does
+not read the pages.
 
-**No KV cache management**
-Memory pressure estimated but not actively managed. Under
-sustained load with long sequences, GPU memory could fill
-without graceful degradation.
-Fix: implement block-based KV cache management (see PagedAttention).
-
-**No request timeout or backpressure**
-Requests queue indefinitely. Under extreme load, queue depth
-grows unbounded.
-Fix: add per-request timeout (408) and max queue depth (429/503).
+**Backpressure**
+Admission returns 503 before any SSE byte when free pages cannot
+cover the prompt. Queue depth is a second 503. A token wait past
+30s returns 408.
 
 **Single worker**
 Hardware constraint — RTX 4050 6GB can only fit one
