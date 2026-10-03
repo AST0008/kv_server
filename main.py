@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
+import os
+import threading
+import uuid
 import torch
 import uvicorn
 from transformers import pipeline
@@ -10,6 +13,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import time
 import traceback
+
+from kv_pages import PagePool
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -33,13 +38,12 @@ BATCH_SIZE = 8
 # Higher = more time waiting to batch up, better GPU utilization, but higher latency
 BATCH_WAIT_TIME = 0.05
 
-# TinyLlama-1.1B architecture constants for KV cache estimation
-KV_LAYERS = 22
-KV_HEADS = 32
-KV_HEAD_DIM = 64
-KV_BYTES_PER_VALUE = 2  # bfloat16
+# Tokens per KV page. A request's block table maps logical pages to these.
+BLOCK_SIZE = 16
+# Optional cap. Unset: size the pool from free GPU memory after the weights load.
+KV_NUM_BLOCKS = os.environ.get("KV_NUM_BLOCKS")
 
-MAX_QUEUE_DEPTH = 20      # reject with 503 if queue exceeds this
+MAX_QUEUE_DEPTH = 20      # second 503, after the page pool admits the prompt
 REQUEST_TIMEOUT_S = 30    # reject with 408 if waiting longer than this
 MAX_NEW_TOKENS = 200
 
@@ -51,6 +55,8 @@ class Request:
     id: str
     prompt: str
     result_queue: asyncio.Queue
+    block_ids: list = field(default_factory=list)
+    kv_tokens: int = 0
 
 @dataclass
 class ServerStats:
@@ -68,10 +74,11 @@ executor = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 @dataclass
 class Slot:
-    """One in-flight request. past is that row's KV only, with no padding."""
+    """One in-flight request. KV lives in the page pool, not on this object."""
 
     request: Request
-    past: tuple
+    block_ids: list
+    num_tokens: int
     next_id: int
     generated: list
     printed: str = ""
@@ -102,17 +109,6 @@ def _slice_row(legacy, index, length):
         layers.append((
             key[index:index + 1, :, :length, :].contiguous(),
             value[index:index + 1, :, :length, :].contiguous(),
-        ))
-    return tuple(layers)
-
-
-def _take_real_suffix(legacy, index, length):
-    """After a left-padded decode step, keep the last `length` real positions."""
-    layers = []
-    for key, value in legacy:
-        layers.append((
-            key[index:index + 1, :, -length:, :].contiguous(),
-            value[index:index + 1, :, -length:, :].contiguous(),
         ))
     return tuple(layers)
 
@@ -152,6 +148,51 @@ class InferenceEngine:
             device_map="auto"
         )
         print("Pipeline loaded.")
+        self._tok_lock = threading.Lock()
+        self.pages = self._build_pages()
+        page_stats = self.pages.stats()
+        print(
+            f"KV pages: {page_stats['num_blocks']} blocks "
+            f"x {page_stats['block_size']} tokens "
+            f"({page_stats['bytes_per_token']} bytes/token)"
+        )
+
+    def _build_pages(self) -> PagePool:
+        model = self.pipe.model
+        cfg = model.config
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+        n_layers = cfg.num_hidden_layers
+        n_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+        head_dim = getattr(cfg, "head_dim", None) or (
+            cfg.hidden_size // cfg.num_attention_heads
+        )
+        probe = PagePool(
+            num_blocks=1,
+            block_size=BLOCK_SIZE,
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device="cpu",
+        )
+        if KV_NUM_BLOCKS:
+            num_blocks = int(KV_NUM_BLOCKS)
+        elif device.type == "cuda":
+            free, _total = torch.cuda.mem_get_info(device)
+            # Leave room for the contiguous cache the forward pass still gathers.
+            num_blocks = max(8, int(free * 0.40) // probe.bytes_per_block)
+        else:
+            num_blocks = 32
+        return PagePool(
+            num_blocks=num_blocks,
+            block_size=BLOCK_SIZE,
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+        )
         
         
     async def collect_batch(self):
@@ -188,6 +229,22 @@ class InferenceEngine:
             messages, tokenize=False, add_generation_prompt=True
         )
 
+    def _prompt_length(self, prompt: str) -> int:
+        text = self._chat_prompt(Request(id="", prompt=prompt, result_queue=None))
+        with self._tok_lock:
+            tokenizer = self.pipe.tokenizer
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            encoded = tokenizer(text, return_tensors="pt")
+        return int(encoded["attention_mask"].sum().item())
+
+    def _release(self, request: Request, n_tokens: int) -> None:
+        if not request.block_ids and n_tokens == 0:
+            return
+        self.pages.release(request.block_ids, n_tokens)
+        request.block_ids = []
+        request.kv_tokens = 0
+
     def _emit(self, slot, token_id, loop):
         tokenizer = self.pipe.tokenizer
         eos = tokenizer.eos_token_id
@@ -197,7 +254,8 @@ class InferenceEngine:
             return
         slot.generated.append(token_id)
         slot.new_count += 1
-        decoded = tokenizer.decode(slot.generated, skip_special_tokens=True)
+        with self._tok_lock:
+            decoded = tokenizer.decode(slot.generated, skip_special_tokens=True)
         if not decoded.endswith("\ufffd"):
             delta = decoded[len(slot.printed):]
             slot.printed = decoded
@@ -217,7 +275,8 @@ class InferenceEngine:
             tokenizer.pad_token = tokenizer.eos_token
         device = next(model.parameters()).device
         prompts = [self._chat_prompt(request) for request in requests]
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+        with self._tok_lock:
+            encoded = tokenizer(prompts, return_tensors="pt", padding=True)
         encoded = {key: value.to(device) for key, value in encoded.items()}
         with torch.inference_mode():
             out = model(**encoded, use_cache=True)
@@ -225,22 +284,69 @@ class InferenceEngine:
         slots = []
         for i, request in enumerate(requests):
             length = int(encoded["attention_mask"][i].sum().item())
+            need = self.pages.blocks_for(length)
+            if need > len(request.block_ids):
+                extra = self.pages.try_alloc(need - len(request.block_ids))
+                if extra is None:
+                    self._pages_exhausted(request, loop)
+                    slots.append(Slot(
+                        request=request,
+                        block_ids=request.block_ids,
+                        num_tokens=request.kv_tokens,
+                        next_id=0,
+                        generated=[],
+                        finished=True,
+                    ))
+                    continue
+                request.block_ids.extend(extra)
             past = _slice_row(legacy, i, length)
+            keys = [key[0] for key, _value in past]
+            values = [value[0] for _key, value in past]
+            # write the keys and values to the pages
+            self.pages.write(request.block_ids, keys, values, 0)
+            request.kv_tokens = length
             token_id = int(out.logits[i, length - 1].argmax().item())
-            slot = Slot(request=request, past=past, next_id=token_id, generated=[])
+            slot = Slot(
+                request=request,
+                block_ids=request.block_ids,
+                num_tokens=length,
+                next_id=token_id,
+                generated=[],
+            )
             self._emit(slot, token_id, loop)
             slots.append(slot)
+        del out, legacy
         return slots
 
+    def _pages_exhausted(self, request, loop):
+        loop.call_soon_threadsafe(
+            request.result_queue.put_nowait, "Error: KV pages exhausted"
+        )
+        loop.call_soon_threadsafe(request.result_queue.put_nowait, None)
+
     def _decode_step(self, slots, loop):
+        """
+        decode the active requests
+        """
         model = self.pipe.model
         device = next(model.parameters()).device
-        running = [slot for slot in slots if not slot.finished]
+        running = []
+        for slot in slots:
+            if slot.finished:
+                continue
+            if not self.pages.ensure_slot(slot.block_ids, slot.num_tokens):
+                slot.finished = True
+                self._pages_exhausted(slot.request, loop)
+                continue
+            running.append(slot)
         if not running:
             return
-        lengths = [slot.past[0][0].shape[2] for slot in running]
+        lengths = [slot.num_tokens for slot in running]
         max_len = max(lengths)
-        legacy = _batch_left_pad([slot.past for slot in running])
+        # gather the keys and values from the pages
+        legacy = _batch_left_pad([
+            self.pages.gather(slot.block_ids, slot.num_tokens) for slot in running
+        ])
         input_ids = torch.tensor(
             [[slot.next_id] for slot in running], dtype=torch.long, device=device
         )
@@ -263,12 +369,21 @@ class InferenceEngine:
             )
         new_legacy = _legacy_layers(out.past_key_values)
         for i, slot in enumerate(running):
-            slot.past = _take_real_suffix(new_legacy, i, lengths[i] + 1)
+            keys = []
+            values = []
+            for key, value in new_legacy:
+                keys.append(key[i, :, -1:, :].contiguous())
+                values.append(value[i, :, -1:, :].contiguous())
+            self.pages.write(slot.block_ids, keys, values, slot.num_tokens)
+            slot.num_tokens += 1
+            slot.request.kv_tokens = slot.num_tokens
             token_id = int(out.logits[i, -1].argmax().item())
             self._emit(slot, token_id, loop)
+        del out, new_legacy
 
     def _fail(self, requests, error):
         for request in requests:
+            self._release(request, request.kv_tokens)
             request.result_queue.put_nowait(f"Error: {error}")
             request.result_queue.put_nowait(None)
 
@@ -276,6 +391,7 @@ class InferenceEngine:
         still = []
         for slot in slots:
             if slot.finished:
+                self._release(slot.request, slot.num_tokens)
                 self.stats.active_requests -= 1
                 self.stats.total_requests_processed += 1
                 self.stats.total_tokens_generated += slot.new_count
@@ -306,15 +422,19 @@ class InferenceEngine:
                 self.stats.current_batch_size = len(active) + len(incoming)
                 print(f"Admitting {len(incoming)} requests, {len(active)} already running")
                 try:
+                    # prefill the new requests
                     newcomers = await loop.run_in_executor(
                         executor, lambda reqs=incoming: self._prefill(reqs, loop)
                     )
+                    # add the newcomers to the active list
                     active.extend(newcomers)
                 except Exception as e:
                     traceback.print_exc()
+                    # if there is an error, fail the incoming requests
                     self._fail(incoming, e)
                     self.stats.active_requests -= len(incoming)
                 finally:
+                    # mark the incoming requests as done
                     for _ in incoming:
                         self.queue.task_done()
                 active = self._close_finished(active)
@@ -323,13 +443,16 @@ class InferenceEngine:
                 continue
 
             try:
+                # decode the active requests
                 await loop.run_in_executor(
                     executor, lambda slots=list(active): self._decode_step(slots, loop)
                 )
             except Exception as e:
+                # if there is an error, fail the active requests
                 traceback.print_exc()
                 self._fail([slot.request for slot in active], e)
                 self.stats.active_requests -= len(active)
+                # clear the active list
                 active = []
                 self.stats.current_batch_size = 0
                 continue
@@ -345,17 +468,39 @@ class InferenceEngine:
         self.stats.last_batch_time = duration
         self.stats.current_batch_size = 0  
         
-    async def submit(self, prompt: str, request_id: str):
-        
+    def reserve(self, prompt: str) -> list:
+        """Take prompt pages before the response starts, or raise 503.
+
+        Free KV pages are the admission check. Queue depth is a second
+        check, and any pages taken for a rejected request are returned.
+        """
+        prompt_tokens = self._prompt_length(prompt)
+        need = self.pages.blocks_for(prompt_tokens)
+        block_ids = self.pages.try_alloc(need)
+        if block_ids is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"KV pages exhausted. need {need} blocks "
+                    f"for {prompt_tokens} prompt tokens, "
+                    f"free {self.pages.free_count()}"
+                ),
+            )
         if self.queue.qsize() >= MAX_QUEUE_DEPTH:
-            raise HTTPException(status_code=503,
-            detail=f"Server overloaded. Queue depth: {self.queue.qsize()}")
-        
+            self.pages.release(block_ids)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Server overloaded. Queue depth: {self.queue.qsize()}",
+            )
+        return block_ids
+
+    async def submit(self, prompt: str, request_id: str, block_ids: list):
         result_queue = asyncio.Queue()
         request = Request(
             id=request_id,
             prompt=prompt,
-            result_queue=result_queue
+            result_queue=result_queue,
+            block_ids=block_ids,
         )
         await self.queue.put(request)
         try:
@@ -379,42 +524,22 @@ class InferenceEngine:
             )
 
     def get_kv_cache_stats(self) -> dict:
-        """
-        Estimate KV cache memory usage.
-        
-        Formula for TinyLlama-1.1B:
-        - 22 transformer layers
-        - 32 attention heads  
-        - 64 head dimension
-        - 2 matrices per layer (K and V)
-        - 2 bytes per value (bfloat16)
-        
-        bytes_per_token = 2 * 22 * 32 * 64 * 2 = 180,224 bytes ≈ 180KB
-        """
-        bytes_per_token = KV_BYTES_PER_VALUE * KV_LAYERS * KV_HEADS * KV_HEAD_DIM * 2
-        
-        # estimate tokens in flight: active_requests * avg_tokens_so_far
-        # use 100 as rough midpoint of 200 max tokens
-        estimated_tokens_in_flight = self.stats.active_requests * 100
-        estimated_kv_bytes = estimated_tokens_in_flight * bytes_per_token
-        
+        """Physical KV pages this process owns. Not an estimate."""
+        stats = self.pages.stats()
         gpu_total = 0
         gpu_used = 0
-        
+
         if torch.cuda.is_available():
             gpu_total = torch.cuda.get_device_properties(0).total_memory
             gpu_used = torch.cuda.memory_allocated(0)
-            
-        return {
-            "bytes_per_token": bytes_per_token,
-            "estimated_tokens_in_flight": estimated_tokens_in_flight,
-            "estimated_kv_bytes": estimated_kv_bytes,
-            "estimated_kv_mb": round(estimated_kv_bytes / (1024**2)),
+
+        stats.update({
             "gpu_total_mb": round(gpu_total / (1024**2)),
             "gpu_used_mb": round(gpu_used / (1024**2)),
             "gpu_free_mb": round((gpu_total - gpu_used) / (1024**2)) if gpu_total else 0,
-            "gpu_utilisation_percent": round(gpu_used / gpu_total * 100,2) if gpu_total else 0
-        }
+            "gpu_utilisation_percent": round(gpu_used / gpu_total * 100, 2) if gpu_total else 0,
+        })
+        return stats
         
     
 app = FastAPI()
@@ -428,8 +553,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def chat_sse(question: str):
-    async for token in engine.submit(question, "default_id"):
+async def chat_sse(question: str, request_id: str, block_ids: list):
+    # Comment, not a data line, so the chat client does not print the id.
+    yield f": request {request_id}\n\n"
+    async for token in engine.submit(question, request_id, block_ids):
         yield f"data: {token}\n\n"
     yield "data: [DONE]\n\n"
 
@@ -443,12 +570,15 @@ async def root():
 
 @app.post("/generate")
 async def main(payload: ChatRequest):
-    
+    request_id = str(uuid.uuid4())
     with tracer.start_as_current_span("http_request") as span:
         span.set_attribute("prompt.length", len(payload.question))
+        span.set_attribute("request.id", request_id)
+    block_ids = engine.reserve(payload.question)
     return StreamingResponse(
-        chat_sse(payload.question),
-        media_type="text/event-stream"
+        chat_sse(payload.question, request_id, block_ids),
+        media_type="text/event-stream",
+        headers={"X-Request-Id": request_id},
     )
 
 @app.get("/metrics")
@@ -471,6 +601,8 @@ async def metrics():
         "config": {
             "batch_size": BATCH_SIZE,
             "batch_wait_ms": BATCH_WAIT_TIME * 1000,
+            "kv_block_size": BLOCK_SIZE,
+            "kv_num_blocks": engine.pages.num_blocks,
             "max_queue_depth": MAX_QUEUE_DEPTH,
             "request_timeout_s": REQUEST_TIMEOUT_S,
             "max_new_tokens": 200,
